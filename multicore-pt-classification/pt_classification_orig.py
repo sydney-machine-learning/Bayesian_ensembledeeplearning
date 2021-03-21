@@ -11,7 +11,6 @@ import time
 import operator
 import math
 import matplotlib as mpl
-import torch
 mpl.use('agg')
 import matplotlib.mlab as mlab
 import matplotlib.pyplot as plt
@@ -21,34 +20,23 @@ from scipy.stats import multivariate_normal
 from scipy.stats import norm
 #import GPy
 #np.random.seed(1)
-import torch.nn as nn
-from torch import optim, tensor, from_numpy
-import torch.nn.functional as F
 
-import copy
 import io
 
-torch.backends.cudnn.benchmark = True
-
-class Network(nn.Module):
+class Network:
 
     def __init__(self, Topo, Train, Test, learn_rate):
-        super().__init__()
         self.Top = Topo  # NN topology [input, hidden, output]
         self.TrainData = Train
         self.TestData = Test
         self.lrate = learn_rate
+        self.W1 = np.random.randn(self.Top[0], self.Top[1]) / np.sqrt(self.Top[0])
+        self.B1 = np.random.randn(1, self.Top[1]) / np.sqrt(self.Top[1])  # bias first layer
+        self.W2 = np.random.randn(self.Top[1], self.Top[2]) / np.sqrt(self.Top[1])
+        self.B2 = np.random.randn(1, self.Top[2]) / np.sqrt(self.Top[1])  # bias second layer
+        self.hidout = np.zeros((1, self.Top[1]))  # output of first hidden layer
         self.out = np.zeros((1, self.Top[2]))  # output last layer
         self.pred_class = 0
-
-        self.net = nn.Sequential(
-            nn.Linear(self.Top[0], self.Top[1]),
-            nn.Sigmoid(),
-            nn.Linear(self.Top[1], self.Top[2]),
-            nn.Sigmoid(),
-        )
-
-        self.opt = optim.SGD(self.parameters(), lr=self.lrate)
 
     def sigmoid(self, x):
         return 1 / (1 + np.exp(-x))
@@ -59,34 +47,69 @@ class Network(nn.Module):
         return sqerror
 
     def ForwardPass(self, X):
-        self.out = self.net(tensor(X, dtype=torch.float32))
+        z1 = X.dot(self.W1) - self.B1
+        self.hidout = self.sigmoid(z1)  # output of first hidden layer
+        z2 = self.hidout.dot(self.W2) - self.B2
+        self.out = self.sigmoid(z2)  # output second hidden layer
 
-        self.pred_class = torch.argmax(self.out)
+        self.pred_class = np.argmax(self.out)
 
 
         #print(self.pred_class, self.out, '  ---------------- out ')
 
+    '''def BackwardPass(self, Input, desired):
+        out_delta = (desired - self.out).dot(self.out.dot(1 - self.out))
+        hid_delta = out_delta.dot(self.W2.T) * (self.hidout * (1 - self.hidout))
+        print(self.B2.shape)
+        self.W2 += (self.hidout.T.reshape(self.Top[1],1).dot(out_delta) * self.lrate)
+        self.B2 += (-1 * self.lrate * out_delta)
+        self.W1 += (Input.T.reshape(self.Top[0],1).dot(hid_delta) * self.lrate)
+        self.B1 += (-1 * self.lrate * hid_delta)'''
+
+
+
+
+    def BackwardPass(self, Input, desired): # since data outputs and number of output neuons have different orgnisation
+        onehot = np.zeros((desired.size, self.Top[2]))
+        onehot[np.arange(desired.size),int(desired)] = 1
+        desired = onehot
+        out_delta = (desired - self.out)*(self.out*(1 - self.out))
+        hid_delta = np.dot(out_delta,self.W2.T) * (self.hidout * (1 - self.hidout))
+        self.W2 += np.dot(self.hidout.T,(out_delta * self.lrate))
+        self.B2 += (-1 * self.lrate * out_delta)
+        Input = Input.reshape(1,self.Top[0])
+        self.W1 += np.dot(Input.T,(hid_delta * self.lrate))
+        self.B1 += (-1 * self.lrate * hid_delta)
+
+
     def decode(self, w):
+        w_layer1size = self.Top[0] * self.Top[1]
+        w_layer2size = self.Top[1] * self.Top[2]
 
-        dic = {}
-        i = 0
-        for name in sorted(self.state_dict().keys()):
-            dic[name] = torch.FloatTensor(w[i:i + (self.state_dict()[name]).view(-1).shape[0]]).view(
-                self.state_dict()[name].shape)
-            i += (self.state_dict()[name]).view(-1).shape[0]
+        w_layer1 = w[0:w_layer1size]
+        self.W1 = np.reshape(w_layer1, (self.Top[0], self.Top[1]))
 
-        self.load_state_dict(dic)
+        w_layer2 = w[w_layer1size:w_layer1size + w_layer2size]
+        self.W2 = np.reshape(w_layer2, (self.Top[1], self.Top[2]))
+        self.B1 = w[w_layer1size + w_layer2size:w_layer1size + w_layer2size + self.Top[1]].reshape(1,self.Top[1])
+        self.B2 = w[w_layer1size + w_layer2size + self.Top[1]:w_layer1size + w_layer2size + self.Top[1] + self.Top[2]].reshape(1,self.Top[2])
 
 
 
     def encode(self):
+        w1 = self.W1.ravel()
+        w1 = w1.reshape(1,w1.shape[0])
+        w2 = self.W2.ravel()
+        w2 = w2.reshape(1,w2.shape[0])
+        w = np.concatenate([w1.T, w2.T, self.B1.T, self.B2.T])
+        w = w.reshape(-1)
+        return w
 
-        l = np.array([1, 2])
-        dic = self.state_dict()
-        for name in sorted(dic.keys()):
-            l = np.concatenate((1, np.array(copy.deepcop(dic[name])).reshape(-1)), axis=None)
-        
-        return l[2:]
+    def softmax(self):
+        prob = np.exp(self.out)/np.sum(np.exp(self.out))
+        return prob
+
+
 
     def langevin_gradient(self, data, w, depth):  # BP with SGD (Stocastic BP)
 
@@ -103,13 +126,7 @@ class Network(nn.Module):
                 Input = data[pat, 0:self.Top[0]]
                 Desired = data[pat, self.Top[0]:]
                 self.ForwardPass(Input)
-
-                loss = F.mse_loss(self.out, Desired)
-                loss.backward()
-                self.opt.step()
-                self.opt.zero_grad()
-
-                # self.BackwardPass(Input, Desired)
+                self.BackwardPass(Input, Desired)
         w_updated = self.encode()
 
         return  w_updated
@@ -128,8 +145,7 @@ class Network(nn.Module):
             Input = data[i, 0:self.Top[0]]
             self.ForwardPass(Input)
             fx[i] = self.pred_class
-            # prob[i] = self.softmax()
-            prob[i] = F.softmax(self.out.detach())
+            prob[i] = self.softmax()
 
         #print(fx, 'fx')
         #print(prob, 'prob' )
